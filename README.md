@@ -1,7 +1,8 @@
 # cLearn — A Hands-On C++ Learning Repository
 
 A complete, project-driven path from "I know another language" to writing a
-persistent REST API in modern C++ and gameplay code in Unreal Engine 5.
+persistent REST API in modern C++ and gameplay code in Unreal Engine 5, plus
+the C underneath it all: manual memory management, hardware drivers and assembly.
 
 Every chapter follows the same structure:
 
@@ -51,6 +52,14 @@ NN-topic/
 | 19 | [Gameplay Systems](part4-unreal/19-gameplay-systems/README.md) | health/damage, delegates, interfaces, timers, GameMode |
 | 20 | [UI & Save Games](part4-unreal/20-ui-and-saving/README.md) | UMG widgets from C++, `USaveGame` persistence |
 
+### Part 5 — C and Low-Level Programming
+| # | Chapter | You will learn |
+|---|---------|----------------|
+| 21 | [C Essentials for C++ Programmers](part5-c-lowlevel/21-c-essentials/README.md) | what C lacks, structs & strings, the preprocessor, opaque types, `goto` cleanup |
+| 22 | [Memory Management in C](part5-c-lowlevel/22-c-memory/README.md) | `malloc`/`realloc`/`free`, ownership, dynamic arrays, arena & pool allocators, your own `malloc`, ASan |
+| 23 | [Writing a Hardware Controller](part5-c-lowlevel/23-hardware-controller/README.md) | memory-mapped registers, `volatile`, interrupts, drivers, a simulated fan controller, a bare-metal STM32 port |
+| 24 | [Combining C and Assembly](part5-c-lowlevel/24-c-and-asm/README.md) | calling conventions, inline asm, `.S` files for x86-64 & AArch64, intrinsics |
+
 ## Getting started
 
 Read **[docs/00-setup.md](docs/00-setup.md)** first. Short version:
@@ -82,6 +91,7 @@ cd part3-crud-api && docker compose up --build
 | 14 (PostgreSQL) | built with GCC 14 (Linux container), examples and solutions run against PostgreSQL 16 |
 | 3 (Tasks API) | clang + GCC 14; 24 doctest cases incl. PostgreSQL contract tests; curl smoke test against the Docker stack; exercise solutions patch (30 cases) |
 | 4 (Unreal) | written against the UE 5.4/5.5 APIs, but **not compiled** (needs an engine install): see the part 4 README |
+| 5 (C & low level) | 42 C programs + the FC-1 simulator project, compiled with `-Wall -Wextra -Wpedantic` with Apple clang 21 on x86-64 macOS and run (chapter 22 also under ASan/UBSan); the AArch64 code is cross-compiled and linked with `-arch arm64`, and the `.S` files are also cross-assembled for Linux ELF. The STM32 port is cross-compiled but has not been run on a board |
 
 ## How to study
 
@@ -95,7 +105,7 @@ cd part3-crud-api && docker compose up --build
 
 ```
 cLearn/
-├── CMakeLists.txt          ← builds all of parts 1–2 (and the API, opt-in)
+├── CMakeLists.txt          ← builds parts 1, 2 and 5 (and the API, opt-in)
 ├── compose.yaml            ← PostgreSQL + a Linux dev container (docker/dev.Dockerfile)
 ├── cmake/                  ← shared CMake helpers (Chapter.cmake, Deps.cmake)
 ├── docs/                   ← setup, cheatsheet, glossary, further reading
@@ -103,5 +113,6 @@ cLearn/
 ├── part1-fundamentals/
 ├── part2-persistence/
 ├── part3-crud-api/         ← standalone CMake project (also buildable from root)
-└── part4-unreal/           ← UE5 source + guides (built inside an Unreal project)
+├── part4-unreal/           ← UE5 source + guides (built inside an Unreal project)
+└── part5-c-lowlevel/       ← C17, a simulated microcontroller, a bare-metal STM32 port, x86-64/AArch64 asm
 ```

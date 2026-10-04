@@ -35,3 +35,30 @@
 - **UObject / UCLASS / UPROPERTY** (Unreal): Unreal's reflection system that
   enables garbage collection, Blueprints, serialization and the editor.
 - **vtable**: the hidden table of function pointers that makes `virtual` calls work.
+
+## Part 5 (C and low level)
+
+- **Arena allocator**: hands out memory by bumping an offset in one big block
+  and frees everything at once. Ideal for per-frame or per-request data.
+- **Calling convention**: the part of the ABI that says which registers hold
+  arguments and return values, and which registers a function must preserve.
+- **Callee-saved register**: a register a function must restore before it
+  returns (x86-64: `rbx`, `rbp`, `r12`–`r15`; AArch64: `x19`–`x28`).
+- **Critical section**: code that runs with interrupts (or other threads)
+  locked out, so shared multi-word data stays consistent.
+- **Inline assembly**: assembly instructions embedded in C with
+  `__asm__("..." : outputs : inputs : clobbers)`.
+- **Interrupt service routine (ISR)**: a function the CPU runs when hardware
+  signals an event. It must be short and must acknowledge the event.
+- **Memory-mapped I/O (MMIO)**: controlling hardware by reading and writing
+  special addresses that are wired to device registers.
+- **Opaque type**: a struct declared in a header but defined only in one `.c`
+  file, so users can hold pointers to it but not see inside. C's `private`.
+- **Pool allocator**: hands out fixed-size blocks from a free list in O(1),
+  with no fragmentation.
+- **Vector table**: an array of handler addresses that the CPU consults on
+  reset and on each interrupt.
+- **`volatile`**: tells the compiler that every access to a variable is an
+  observable side effect, so it must not be cached, removed or reordered.
+- **W1C (write-1-to-clear)**: a register type where writing a 1 to a bit
+  clears that flag.

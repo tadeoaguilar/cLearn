@@ -3,10 +3,16 @@
 # clearn_add_chapter(<chapter_dir>)
 #   If the chapter has its own CMakeLists.txt it is added with add_subdirectory()
 #   (chapters that build libraries or need extra dependencies). Otherwise every
-#   .cpp directly inside examples/ and solutions/ becomes its own executable:
+#   .cpp (or, in part 5, .c) directly inside examples/ and solutions/ becomes its
+#   own executable:
 #
 #   part1-fundamentals/01-basics/examples/01_hello_world.cpp    -> ch01_ex_01_hello_world
 #   part1-fundamentals/01-basics/solutions/ex01_temperature.cpp -> ch01_sol_ex01_temperature
+#   part5-c-lowlevel/22-c-memory/examples/05_arena.c            -> ch22_ex_05_arena
+#
+#   A source file may name extra files to build with it (an assembly partner):
+#     // build: also-compile 04_functions.S
+#   scripts/check.sh understands the same marker.
 #
 # clearn_add_standalone_sources(<chapter_dir>)
 #   Only the "one executable per .cpp" part; custom chapter CMakeLists call it too.
@@ -35,11 +41,19 @@ function(clearn_add_standalone_sources dir)
     else()
       set(prefix "ch${num}_sol_")
     endif()
-    file(GLOB sources CONFIGURE_DEPENDS ${dir}/${kind}/*.cpp)
+    file(GLOB sources CONFIGURE_DEPENDS ${dir}/${kind}/*.cpp ${dir}/${kind}/*.c)
     foreach(src IN LISTS sources)
       get_filename_component(stem ${src} NAME_WE)
+      get_filename_component(src_dir ${src} DIRECTORY)
       set(target ${prefix}${stem})
-      add_executable(${target} ${src})
+      set(extra_sources "")
+      file(STRINGS ${src} markers REGEX "^// build: also-compile ")
+      foreach(marker IN LISTS markers)
+        string(REGEX REPLACE "^// build: also-compile +" "" extra "${marker}")
+        string(STRIP "${extra}" extra)
+        list(APPEND extra_sources ${src_dir}/${extra})
+      endforeach()
+      add_executable(${target} ${src} ${extra_sources})
       clearn_warnings(${target})
       target_link_libraries(${target} PRIVATE Threads::Threads)
       # Put binaries next to their chapter: build/part1-fundamentals/01-basics/ch01_ex_...
