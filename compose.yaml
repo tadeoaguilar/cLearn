@@ -1,0 +1,40 @@
+# Development services for parts 2 and 3.
+#
+#   docker compose up -d db                 # PostgreSQL on localhost:5432
+#   docker compose run --rm dev             # a Linux shell with g++-14, CMake, libpq
+#
+# Inside the dev container the database host is "db" (DATABASE_URL is preset).
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: clearn
+      POSTGRES_PASSWORD: clearn
+      POSTGRES_DB: clearn
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clearn -d clearn"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  dev:
+    build:
+      context: .
+      dockerfile: docker/dev.Dockerfile
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - devbuild:/workspace/build-docker   # keep Linux build artifacts out of your macOS tree
+    environment:
+      DATABASE_URL: postgresql://clearn:clearn@db:5432/clearn
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  devbuild:

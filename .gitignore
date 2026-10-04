@@ -1,0 +1,15 @@
+build/
+build-*/
+cmake-build-*/
+.cache/
+compile_commands.json
+*.o
+*.out
+.DS_Store
+.vscode/
+.idea/
+# Unreal Engine generated folders (part 4 projects)
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/

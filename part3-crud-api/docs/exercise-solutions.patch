@@ -1,0 +1,839 @@
+diff -ruN a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt	2026-10-03 10:45:02
++++ b/CMakeLists.txt	2026-10-03 10:45:02
+@@ -73,7 +73,8 @@
+     tests/test_service.cpp
+     tests/test_json_mapping.cpp
+     tests/test_repository_contract.cpp
+-    tests/test_http.cpp)
++    tests/test_http.cpp
++    tests/test_exercises.cpp)
+   target_link_libraries(tasks_tests PRIVATE tasks_core doctest::doctest $<$<BOOL:${TASKS_WITH_POSTGRES}>:tasks_pg>)
+   tasks_warnings(tasks_tests)
+   add_test(NAME tasks_tests COMMAND tasks_tests)
+diff -ruN a/src/app/config.cpp b/src/app/config.cpp
+--- a/src/app/config.cpp	2026-10-03 10:45:02
++++ b/src/app/config.cpp	2026-10-03 10:45:02
+@@ -40,6 +40,8 @@
+     c.db_pool_size = env_int("DB_POOL_SIZE", c.db_pool_size, 1, 256);
+     c.http_threads = env_int("HTTP_THREADS", c.http_threads, 1, 1024);
+     c.log_level = env("LOG_LEVEL", c.log_level);
++    c.api_key = env("API_KEY");
++    c.rate_limit_rps = env_int("RATE_LIMIT_RPS", 0, 0, 100000);
+     return c;
+ }
+ 
+diff -ruN a/src/app/config.hpp b/src/app/config.hpp
+--- a/src/app/config.hpp	2026-10-03 10:45:02
++++ b/src/app/config.hpp	2026-10-03 10:45:02
+@@ -14,6 +14,8 @@
+     int db_pool_size = 8;
+     int http_threads = 8;
+     std::string log_level = "info";
++    std::string api_key;            // EX2: API_KEY
++    double rate_limit_rps = 0;      // EX6: RATE_LIMIT_RPS (0 = off)
+ };
+ 
+ // Reads HOST, PORT, STORAGE, DATABASE_URL, DB_POOL_SIZE, HTTP_THREADS, LOG_LEVEL.
+diff -ruN a/src/domain/errors.hpp b/src/domain/errors.hpp
+--- a/src/domain/errors.hpp	2026-10-03 10:45:02
++++ b/src/domain/errors.hpp	2026-10-03 10:45:02
+@@ -28,6 +28,12 @@
+     using std::runtime_error::runtime_error;
+ };
+ 
++// EX3: the client's If-Match version is stale (someone else updated the task first).
++class PreconditionFailedError : public std::runtime_error {
++public:
++    using std::runtime_error::runtime_error;
++};
++
+ // Storage is temporarily unreachable (database down, pool exhausted).
+ class StorageUnavailableError : public std::runtime_error {
+ public:
+diff -ruN a/src/domain/task.hpp b/src/domain/task.hpp
+--- a/src/domain/task.hpp	2026-10-03 10:45:02
++++ b/src/domain/task.hpp	2026-10-03 10:45:02
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include <map>
+ #include <optional>
+ #include <string>
+ #include <string_view>
+@@ -28,6 +29,7 @@
+     std::optional<std::string> due_date; // "YYYY-MM-DD"
+     std::string created_at;              // ISO 8601 UTC, e.g. "2026-10-03T14:00:00Z"
+     std::string updated_at;
++    int version{1};                      // EX3: bumped on every update (optimistic locking)
+ 
+     bool operator==(const Task&) const = default;
+ };
+@@ -76,6 +78,17 @@
+ inline constexpr std::size_t kMaxTitle = 200;
+ inline constexpr std::size_t kMaxDescription = 2000;
+ inline constexpr int kMaxPageSize = 100;
++
++// EX1: aggregate counters for GET /tasks/stats
++struct TaskStats {
++    std::int64_t total{};
++    std::map<TaskStatus, std::int64_t> by_status;
++    std::map<Priority, std::int64_t> by_priority;
++    std::int64_t overdue{}; // due before `today` and not done
++};
++
++// EX3: why an update didn't happen
++enum class UpdateError { NotFound, VersionConflict };
+ 
+ bool is_valid_date(std::string_view yyyy_mm_dd);
+ std::string trim(std::string_view s);
+diff -ruN a/src/http/json_mapping.cpp b/src/http/json_mapping.cpp
+--- a/src/http/json_mapping.cpp	2026-10-03 10:45:02
++++ b/src/http/json_mapping.cpp	2026-10-03 10:45:02
+@@ -4,6 +4,7 @@
+ #include <set>
+ 
+ #include "domain/errors.hpp"
++#include "service/task_service.hpp" // EX5: reuse the business-rule validation
+ 
+ namespace tasks::http {
+ 
+@@ -17,6 +18,7 @@
+         {"due_date", t.due_date ? json(*t.due_date) : json(nullptr)},
+         {"created_at", t.created_at},
+         {"updated_at", t.updated_at},
++        {"version", t.version},
+     };
+ }
+ 
+@@ -85,6 +87,18 @@
+         if (!problems_.empty()) throw ValidationError(std::move(problems_));
+     }
+ 
++    // EX5: run the service's rule checks too, so ONE response lists every problem.
++    // Shape problems win for a field that has both (a non-string title has no length).
++    template <typename T>
++    void finish_with_rules(T& value) {
++        try {
++            tasks::validate(value);
++        } catch (const ValidationError& e) {
++            for (const auto& [field, problem] : e.fields()) problems_.try_emplace(field, problem);
++        }
++        finish();
++    }
++
+ private:
+     const json& body_;
+     std::map<std::string, std::string> problems_;
+@@ -104,7 +118,7 @@
+     t.status = r.enumeration<TaskStatus>("status", parse_status, kStatuses).value_or(TaskStatus::Todo);
+     t.priority = r.enumeration<Priority>("priority", parse_priority, kPriorities).value_or(Priority::Medium);
+     t.due_date = r.nullable_string("due_date").value_or(std::nullopt);
+-    r.finish();
++    r.finish_with_rules(t);
+     return t;
+ }
+ 
+@@ -117,8 +131,28 @@
+     p.status = r.enumeration<TaskStatus>("status", parse_status, kStatuses);
+     p.priority = r.enumeration<Priority>("priority", parse_priority, kPriorities);
+     p.due_date = r.nullable_string("due_date");
+-    r.finish();
++    r.finish_with_rules(p);
+     return p;
++}
++
++json to_json(const TaskStats& s) {
++    json by_status = json::object(), by_priority = json::object();
++    for (auto st : {TaskStatus::Todo, TaskStatus::InProgress, TaskStatus::Done}) // include zeros
++        by_status[std::string(to_string(st))] = s.by_status.contains(st) ? s.by_status.at(st) : 0;
++    for (auto p : {Priority::Low, Priority::Medium, Priority::High})
++        by_priority[std::string(to_string(p))] = s.by_priority.contains(p) ? s.by_priority.at(p) : 0;
++    return json{{"total", s.total}, {"by_status", by_status}, {"by_priority", by_priority}, {"overdue", s.overdue}};
++}
++
++std::vector<TaskId> ids_from_json(const json& body) {
++    if (!body.is_object() || !body.contains("ids") || !body["ids"].is_array())
++        throw ValidationError("ids", "body must be {\"ids\": [<integer>, ...]}");
++    std::vector<TaskId> ids;
++    for (const auto& v : body["ids"]) {
++        if (!v.is_number_integer()) throw ValidationError("ids", "every id must be an integer");
++        ids.push_back(v.get<TaskId>());
++    }
++    return ids;
+ }
+ 
+ } // namespace tasks::http
+diff -ruN a/src/http/json_mapping.hpp b/src/http/json_mapping.hpp
+--- a/src/http/json_mapping.hpp	2026-10-03 10:45:02
++++ b/src/http/json_mapping.hpp	2026-10-03 10:45:02
+@@ -17,6 +17,8 @@
+ 
+ NewTask new_task_from_json(const json& body); // for POST (and PUT, where title is required too)
+ TaskPatch patch_from_json(const json& body);  // for PATCH
++json to_json(const TaskStats& s);             // EX1
++std::vector<TaskId> ids_from_json(const json& body); // EX4: {"ids": [1, 2, 3]}
+ 
+ // {"error": {"code": ..., "message": ..., "details": {...}}}
+ json error_body(std::string_view code, std::string_view message, const json& details = json::object());
+diff -ruN a/src/http/routes.cpp b/src/http/routes.cpp
+--- a/src/http/routes.cpp	2026-10-03 10:45:02
++++ b/src/http/routes.cpp	2026-10-03 10:45:02
+@@ -2,7 +2,10 @@
+ 
+ #include <charconv>
+ #include <chrono>
++#include <memory>
++#include <mutex>
+ #include <string>
++#include <unordered_map>
+ 
+ #include "domain/errors.hpp"
+ #include "http/json_mapping.hpp"
+@@ -90,6 +93,8 @@
+             send_error(res, 400, "malformed_json", e.what());
+         } catch (const NotFoundError& e) {
+             send_error(res, 404, "not_found", e.what());
++        } catch (const PreconditionFailedError& e) { // EX3
++            send_error(res, 412, "precondition_failed", e.what());
+         } catch (const StorageUnavailableError& e) {
+             logger.error("storage unavailable: {}", e.what());
+             send_error(res, 503, "unavailable", "storage is temporarily unavailable, retry later");
+@@ -102,9 +107,61 @@
+ 
+ thread_local std::chrono::steady_clock::time_point t_request_start; // one request per worker thread at a time
+ 
++// ---- EX3: ETag / If-Match ----
++void set_etag(httplib::Response& res, const Task& t) { res.set_header("ETag", "\"" + std::to_string(t.version) + "\""); }
++
++std::optional<int> if_match_version(const httplib::Request& req) {
++    if (!req.has_header("If-Match")) return std::nullopt;
++    std::string v = req.get_header_value("If-Match");
++    if (v.starts_with("W/")) v.erase(0, 2);
++    if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
++    int version{};
++    auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), version);
++    if (ec != std::errc{} || p != v.data() + v.size()) throw ValidationError("If-Match", "must be an ETag returned by this API, e.g. \"3\"");
++    return version;
++}
++
++// ---- EX2: constant-time comparison so attackers can't guess the key byte by byte from timings ----
++bool secure_equals(std::string_view a, std::string_view b) {
++    if (a.size() != b.size()) return false;
++    unsigned char diff = 0;
++    for (std::size_t i = 0; i < a.size(); ++i) diff |= static_cast<unsigned char>(a[i] ^ b[i]);
++    return diff == 0;
++}
++
++// ---- EX6: token bucket per client ----
++class RateLimiter {
++public:
++    RateLimiter(double rate_per_sec, double burst) : rate_{rate_per_sec}, burst_{burst} {}
++
++    // Returns true if the request may proceed.
++    bool allow(const std::string& client) {
++        using clock = std::chrono::steady_clock;
++        auto now = clock::now();
++        std::lock_guard lock(mutex_);
++        auto [it, inserted] = buckets_.try_emplace(client, Bucket{burst_, now});
++        Bucket& b = it->second;
++        double elapsed = std::chrono::duration<double>(now - b.last).count();
++        b.tokens = std::min(burst_, b.tokens + elapsed * rate_); // refill
++        b.last = now;
++        if (b.tokens < 1.0) return false;
++        b.tokens -= 1.0;
++        return true;
++    }
++
++private:
++    struct Bucket {
++        double tokens;
++        std::chrono::steady_clock::time_point last;
++    };
++    double rate_, burst_;
++    std::mutex mutex_;
++    std::unordered_map<std::string, Bucket> buckets_; // production: evict idle entries periodically
++};
++
+ } // namespace
+ 
+-void register_routes(httplib::Server& server, TaskService& service, Logger& logger) {
++void register_routes(httplib::Server& server, TaskService& service, Logger& logger, RouteOptions options) {
+     server.Get("/health", guarded(logger, [&service](const httplib::Request&, httplib::Response& res) {
+         service.repository().ping();
+         send(res, 200, json{{"status", "ok"}, {"storage", service.repository().name()}});
+@@ -119,21 +176,39 @@
+     server.Post("/tasks", guarded(logger, [&service](const httplib::Request& req, httplib::Response& res) {
+         auto task = service.create(new_task_from_json(parse_body(req)));
+         res.set_header("Location", "/tasks/" + std::to_string(task.id));
++        set_etag(res, task);
+         send(res, 201, to_json(task));
+     }));
+ 
++    // EX1: must be registered BEFORE /tasks/:id, or ":id" would capture "stats"
++    server.Get("/tasks/stats", guarded(logger, [&service](const httplib::Request&, httplib::Response& res) {
++        send(res, 200, to_json(service.stats()));
++    }));
++
++    // EX4
++    server.Post("/tasks/bulk-complete", guarded(logger, [&service](const httplib::Request& req, httplib::Response& res) {
++        auto updated = service.complete_many(ids_from_json(parse_body(req)));
++        send(res, 200, json{{"updated", updated}});
++    }));
++
+     server.Get("/tasks/:id", guarded(logger, [&service](const httplib::Request& req, httplib::Response& res) {
+-        send(res, 200, to_json(service.get(parse_id(req))));
++        auto task = service.get(parse_id(req));
++        set_etag(res, task);
++        send(res, 200, to_json(task));
+     }));
+ 
+     server.Put("/tasks/:id", guarded(logger, [&service](const httplib::Request& req, httplib::Response& res) {
+         auto id = parse_id(req);
+-        send(res, 200, to_json(service.replace(id, new_task_from_json(parse_body(req)))));
++        auto task = service.replace(id, new_task_from_json(parse_body(req)), if_match_version(req));
++        set_etag(res, task);
++        send(res, 200, to_json(task));
+     }));
+ 
+     server.Patch("/tasks/:id", guarded(logger, [&service](const httplib::Request& req, httplib::Response& res) {
+         auto id = parse_id(req);
+-        send(res, 200, to_json(service.patch(id, patch_from_json(parse_body(req)))));
++        auto task = service.patch(id, patch_from_json(parse_body(req)), if_match_version(req));
++        set_etag(res, task);
++        send(res, 200, to_json(task));
+     }));
+ 
+     server.Delete("/tasks/:id", guarded(logger, [&service](const httplib::Request& req, httplib::Response& res) {
+@@ -162,8 +237,28 @@
+     });
+ 
+     // Access log with latency. pre_routing runs on the same worker thread as the logger callback.
+-    server.set_pre_routing_handler([](const httplib::Request&, httplib::Response&) {
++    // Runs before routing for EVERY request: timing (base), auth (EX2), rate limiting (EX6).
++    auto limiter = options.rate_limit_rps > 0
++                       ? std::make_shared<RateLimiter>(options.rate_limit_rps, options.rate_limit_burst)
++                       : nullptr;
++    server.set_pre_routing_handler([options, limiter](const httplib::Request& req, httplib::Response& res) {
+         t_request_start = std::chrono::steady_clock::now();
++        if (req.path == "/health") return httplib::Server::HandlerResponse::Unhandled; // probes stay open
++
++        if (limiter && !limiter->allow(req.remote_addr)) {
++            res.set_header("Retry-After", "1");
++            send_error(res, 429, "rate_limited", "too many requests, slow down");
++            return httplib::Server::HandlerResponse::Handled;
++        }
++        if (!options.api_key.empty()) {
++            const std::string auth = req.get_header_value("Authorization");
++            const std::string prefix = "Bearer ";
++            if (!auth.starts_with(prefix) || !secure_equals(std::string_view(auth).substr(prefix.size()), options.api_key)) {
++                res.set_header("WWW-Authenticate", "Bearer");
++                send_error(res, 401, "unauthorized", "missing or invalid API key");
++                return httplib::Server::HandlerResponse::Handled;
++            }
++        }
+         return httplib::Server::HandlerResponse::Unhandled;
+     });
+     server.set_logger([&logger](const httplib::Request& req, const httplib::Response& res) {
+diff -ruN a/src/http/routes.hpp b/src/http/routes.hpp
+--- a/src/http/routes.hpp	2026-10-03 10:45:02
++++ b/src/http/routes.hpp	2026-10-03 10:45:02
+@@ -16,6 +16,12 @@
+ 
+ namespace tasks::http {
+ 
+-void register_routes(httplib::Server& server, TaskService& service, Logger& logger);
++struct RouteOptions {
++    std::string api_key;          // EX2: empty = authentication disabled
++    double rate_limit_rps = 0;    // EX6: tokens per second per client IP; 0 = disabled
++    double rate_limit_burst = 20; // EX6: bucket size
++};
++
++void register_routes(httplib::Server& server, TaskService& service, Logger& logger, RouteOptions options = {});
+ 
+ } // namespace tasks::http
+diff -ruN a/src/infra/migrations.cpp b/src/infra/migrations.cpp
+--- a/src/infra/migrations.cpp	2026-10-03 10:45:02
++++ b/src/infra/migrations.cpp	2026-10-03 10:45:02
+@@ -33,6 +33,8 @@
+         -- A generated column gives a numeric rank we can sort and index on.
+         ALTER TABLE tasks ADD COLUMN priority_rank SMALLINT GENERATED ALWAYS AS (
+             CASE priority WHEN 'low' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END) STORED)sql"},
++    {4, "add_version_for_optimistic_locking", R"sql(
++        ALTER TABLE tasks ADD COLUMN version INT NOT NULL DEFAULT 1)sql"},
+ };
+ 
+ } // namespace
+diff -ruN a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp	2026-10-03 10:45:02
++++ b/src/main.cpp	2026-10-03 10:45:02
+@@ -81,7 +81,9 @@
+     const auto threads = static_cast<std::size_t>(config.http_threads);
+     server.new_task_queue = [threads] { return new httplib::ThreadPool(threads); };
+     server.set_payload_max_length(1024 * 1024); // 1 MiB request bodies are plenty for tasks
+-    http::register_routes(server, service, logger);
++    http::register_routes(server, service, logger,
++                          {.api_key = config.api_key, .rate_limit_rps = config.rate_limit_rps});
++    if (config.api_key.empty()) logger.warn("API_KEY not set: authentication is DISABLED");
+ 
+ #if !defined(_WIN32)
+     std::jthread signal_waiter([&] {
+diff -ruN a/src/repository/memory_task_repository.cpp b/src/repository/memory_task_repository.cpp
+--- a/src/repository/memory_task_repository.cpp	2026-10-03 10:45:02
++++ b/src/repository/memory_task_repository.cpp	2026-10-03 10:45:02
+@@ -88,11 +88,14 @@
+     return result;
+ }
+ 
+-std::optional<Task> MemoryTaskRepository::update(TaskId id, const TaskPatch& p) {
++std::expected<Task, UpdateError> MemoryTaskRepository::update(TaskId id, const TaskPatch& p,
++                                                              std::optional<int> expected_version) {
+     std::unique_lock lock(mutex_);
+     auto it = tasks_.find(id);
+-    if (it == tasks_.end()) return std::nullopt;
++    if (it == tasks_.end()) return std::unexpected(UpdateError::NotFound);
+     Task& t = it->second;
++    if (expected_version && *expected_version != t.version) return std::unexpected(UpdateError::VersionConflict);
++    ++t.version;
+     if (p.title) t.title = *p.title;
+     if (p.description) t.description = *p.description;
+     if (p.status) t.status = *p.status;
+@@ -100,6 +103,33 @@
+     if (p.due_date) t.due_date = *p.due_date;
+     t.updated_at = now_iso8601();
+     return t;
++}
++
++TaskStats MemoryTaskRepository::stats(std::string_view today) {
++    std::shared_lock lock(mutex_);
++    TaskStats s;
++    for (const auto& [id, t] : tasks_) {
++        ++s.total;
++        ++s.by_status[t.status];
++        ++s.by_priority[t.priority];
++        if (t.due_date && *t.due_date < today && t.status != TaskStatus::Done) ++s.overdue; // ISO dates compare as strings
++    }
++    return s;
++}
++
++std::int64_t MemoryTaskRepository::complete_many(const std::vector<TaskId>& ids) {
++    std::unique_lock lock(mutex_); // one lock for the whole batch = all-or-nothing visibility
++    std::int64_t changed = 0;
++    const auto now = now_iso8601();
++    for (TaskId id : ids) {
++        auto it = tasks_.find(id);
++        if (it == tasks_.end() || it->second.status == TaskStatus::Done) continue;
++        it->second.status = TaskStatus::Done;
++        it->second.updated_at = now;
++        ++it->second.version;
++        ++changed;
++    }
++    return changed;
+ }
+ 
+ bool MemoryTaskRepository::remove(TaskId id) {
+diff -ruN a/src/repository/memory_task_repository.hpp b/src/repository/memory_task_repository.hpp
+--- a/src/repository/memory_task_repository.hpp	2026-10-03 10:45:02
++++ b/src/repository/memory_task_repository.hpp	2026-10-03 10:45:02
+@@ -15,7 +15,9 @@
+     Task create(const NewTask& task) override;
+     std::optional<Task> find(TaskId id) override;
+     ListResult list(const ListQuery& query) override;
+-    std::optional<Task> update(TaskId id, const TaskPatch& patch) override;
++    std::expected<Task, UpdateError> update(TaskId id, const TaskPatch& patch, std::optional<int> expected_version) override;
++    TaskStats stats(std::string_view today) override;
++    std::int64_t complete_many(const std::vector<TaskId>& ids) override;
+     bool remove(TaskId id) override;
+     std::string name() const override { return "memory"; }
+ 
+diff -ruN a/src/repository/pg_task_repository.cpp b/src/repository/pg_task_repository.cpp
+--- a/src/repository/pg_task_repository.cpp	2026-10-03 10:45:02
++++ b/src/repository/pg_task_repository.cpp	2026-10-03 10:45:02
+@@ -11,7 +11,7 @@
+ // Format timestamps in SQL so both repositories return identical ISO 8601 strings.
+ constexpr const char* kColumns = R"(id, title, description, status, priority, due_date::text,
+     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+-    to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))";
++    to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), version)";
+ 
+ Task to_task(const pqxx::row& r) {
+     Task t;
+@@ -23,6 +23,7 @@
+     t.due_date = r[5].as<std::optional<std::string>>();
+     t.created_at = r[6].as<std::string>();
+     t.updated_at = r[7].as<std::string>();
++    t.version = r[8].as<int>();
+     return t;
+ }
+ 
+@@ -129,8 +130,9 @@
+     });
+ }
+ 
+-std::optional<Task> PgTaskRepository::update(TaskId id, const TaskPatch& p) {
+-    std::string set = "updated_at = now()";
++std::expected<Task, UpdateError> PgTaskRepository::update(TaskId id, const TaskPatch& p,
++                                                          std::optional<int> expected_version) {
++    std::string set = "updated_at = now(), version = version + 1";
+     pqxx::params params;
+     int n = 0;
+     auto assign = [&](const char* column, auto value, const char* cast = "") {
+@@ -143,14 +145,55 @@
+     if (p.priority) assign("priority", to_db(*p.priority));
+     if (p.due_date) assign("due_date", *p.due_date, "::date"); // inner nullopt → SQL NULL (clears it)
+     params.append(id);
+-    std::string sql = "UPDATE tasks SET " + set + " WHERE id = $" + std::to_string(++n) + " RETURNING " + kColumns;
++    std::string sql = "UPDATE tasks SET " + set + " WHERE id = $" + std::to_string(++n);
++    if (expected_version) {
++        // The version check and the write are ONE atomic statement: no race window.
++        sql += " AND version = $" + std::to_string(++n);
++        params.append(*expected_version);
++    }
++    sql += std::string(" RETURNING ") + kColumns;
+ 
+-    return with_connection([&](pqxx::connection& c) -> std::optional<Task> {
++    return with_connection([&](pqxx::connection& c) -> std::expected<Task, UpdateError> {
+         pqxx::work tx{c};
+         auto r = tx.exec(sql, params);
++        if (!r.empty()) {
++            tx.commit();
++            return to_task(r[0]);
++        }
++        // Nothing updated: was the id missing, or the version stale?
++        bool exists = tx.query_value<bool>("SELECT EXISTS (SELECT 1 FROM tasks WHERE id = $1)", pqxx::params{id});
++        return std::unexpected(exists ? UpdateError::VersionConflict : UpdateError::NotFound);
++    });
++}
++
++TaskStats PgTaskRepository::stats(std::string_view today) {
++    return with_connection([&](pqxx::connection& c) {
++        pqxx::read_transaction tx{c};
++        TaskStats s;
++        // One scan of the table; GROUP BY both dimensions, then fold in C++.
++        for (auto [status, priority, count, overdue] : tx.query<std::string, std::string, std::int64_t, std::int64_t>(
++                 "SELECT status, priority, count(*), "
++                 "       count(*) FILTER (WHERE due_date < $1::date AND status <> 'done') "
++                 "FROM tasks GROUP BY status, priority",
++                 pqxx::params{std::string(today)})) {
++            s.total += count;
++            s.by_status[parse_status(status).value_or(TaskStatus::Todo)] += count;
++            s.by_priority[parse_priority(priority).value_or(Priority::Medium)] += count;
++            s.overdue += overdue;
++        }
++        return s;
++    });
++}
++
++std::int64_t PgTaskRepository::complete_many(const std::vector<TaskId>& ids) {
++    return with_connection([&](pqxx::connection& c) {
++        pqxx::work tx{c};
++        // = ANY($1) takes the whole id list as ONE array parameter: one statement, one round trip.
++        auto r = tx.exec("UPDATE tasks SET status = 'done', updated_at = now(), version = version + 1 "
++                         "WHERE id = ANY($1) AND status <> 'done'",
++                         pqxx::params{ids});
+         tx.commit();
+-        if (r.empty()) return std::nullopt;
+-        return to_task(r[0]);
++        return static_cast<std::int64_t>(r.affected_rows());
+     });
+ }
+ 
+diff -ruN a/src/repository/pg_task_repository.hpp b/src/repository/pg_task_repository.hpp
+--- a/src/repository/pg_task_repository.hpp	2026-10-03 10:45:02
++++ b/src/repository/pg_task_repository.hpp	2026-10-03 10:45:02
+@@ -13,7 +13,9 @@
+     Task create(const NewTask& task) override;
+     std::optional<Task> find(TaskId id) override;
+     ListResult list(const ListQuery& query) override;
+-    std::optional<Task> update(TaskId id, const TaskPatch& patch) override;
++    std::expected<Task, UpdateError> update(TaskId id, const TaskPatch& patch, std::optional<int> expected_version) override;
++    TaskStats stats(std::string_view today) override;
++    std::int64_t complete_many(const std::vector<TaskId>& ids) override;
+     bool remove(TaskId id) override;
+     std::string name() const override { return "postgres"; }
+     void ping() override;
+diff -ruN a/src/repository/task_repository.hpp b/src/repository/task_repository.hpp
+--- a/src/repository/task_repository.hpp	2026-10-03 10:45:02
++++ b/src/repository/task_repository.hpp	2026-10-03 10:45:02
+@@ -2,7 +2,10 @@
+ // main.cpp decides which implementation to plug in (in-memory or PostgreSQL).
+ #pragma once
+ 
++#include <expected>
+ #include <optional>
++#include <string_view>
++#include <vector>
+ #include <string>
+ 
+ #include "domain/task.hpp"
+@@ -16,10 +19,16 @@
+     virtual Task create(const NewTask& task) = 0;
+     virtual std::optional<Task> find(TaskId id) = 0;
+     virtual ListResult list(const ListQuery& query) = 0;
+-    // Applies the patch and returns the updated task, or nullopt if `id` doesn't exist.
+-    virtual std::optional<Task> update(TaskId id, const TaskPatch& patch) = 0;
++    // EX3: applies the patch if the task exists and (when given) its version matches.
++    virtual std::expected<Task, UpdateError> update(TaskId id, const TaskPatch& patch,
++                                                    std::optional<int> expected_version) = 0;
+     // Returns false if `id` doesn't exist.
+     virtual bool remove(TaskId id) = 0;
++
++    // EX1: counts; `today` is "YYYY-MM-DD" (passed in so tests can control the clock)
++    virtual TaskStats stats(std::string_view today) = 0;
++    // EX4: marks the given tasks done in one transaction; returns how many changed
++    virtual std::int64_t complete_many(const std::vector<TaskId>& ids) = 0;
+ 
+     // For /health and logs: "memory" or "postgres".
+     virtual std::string name() const = 0;
+diff -ruN a/src/service/task_service.cpp b/src/service/task_service.cpp
+--- a/src/service/task_service.cpp	2026-10-03 10:45:02
++++ b/src/service/task_service.cpp	2026-10-03 10:45:02
+@@ -1,5 +1,8 @@
+ #include "service/task_service.hpp"
+ 
++#include <algorithm>
++#include <chrono>
++#include <format>
+ #include <map>
+ #include <string>
+ 
+@@ -71,17 +74,39 @@
+     return repo_.list(query);
+ }
+ 
+-Task TaskService::replace(TaskId id, NewTask input) {
++namespace {
++Task unwrap(std::expected<Task, UpdateError> r, TaskId id) {
++    if (r) return *r;
++    if (r.error() == UpdateError::VersionConflict)
++        throw PreconditionFailedError("task " + std::to_string(id) + " was modified by someone else; reload and retry");
++    throw NotFoundError("task " + std::to_string(id) + " not found");
++}
++} // namespace
++
++Task TaskService::replace(TaskId id, NewTask input, std::optional<int> expected_version) {
+     validate(input);
+     TaskPatch all{input.title, input.description, input.status, input.priority, input.due_date};
+-    if (auto t = repo_.update(id, all)) return *t;
+-    throw NotFoundError("task " + std::to_string(id) + " not found");
++    return unwrap(repo_.update(id, all, expected_version), id);
+ }
+ 
+-Task TaskService::patch(TaskId id, TaskPatch patch) {
++Task TaskService::patch(TaskId id, TaskPatch patch, std::optional<int> expected_version) {
+     validate(patch);
+-    if (auto t = repo_.update(id, patch)) return *t;
+-    throw NotFoundError("task " + std::to_string(id) + " not found");
++    return unwrap(repo_.update(id, patch, expected_version), id);
++}
++
++TaskStats TaskService::stats() {
++    auto today = std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now());
++    return repo_.stats(std::format("{:%F}", today));
++}
++
++std::int64_t TaskService::complete_many(std::vector<TaskId> ids) {
++    if (ids.empty()) throw ValidationError("ids", "must not be empty");
++    if (ids.size() > 100) throw ValidationError("ids", "at most 100 ids per request");
++    if (std::ranges::any_of(ids, [](TaskId id) { return id <= 0; })) throw ValidationError("ids", "must be positive integers");
++    std::ranges::sort(ids);
++    auto dup = std::ranges::unique(ids);
++    ids.erase(dup.begin(), dup.end());
++    return repo_.complete_many(ids);
+ }
+ 
+ void TaskService::remove(TaskId id) {
+diff -ruN a/src/service/task_service.hpp b/src/service/task_service.hpp
+--- a/src/service/task_service.hpp	2026-10-03 10:45:02
++++ b/src/service/task_service.hpp	2026-10-03 10:45:02
+@@ -15,8 +15,11 @@
+     Task create(NewTask input);                       // throws ValidationError
+     Task get(TaskId id);                              // throws NotFoundError
+     ListResult list(ListQuery query);                 // throws ValidationError
+-    Task replace(TaskId id, NewTask input);           // PUT: throws ValidationError / NotFoundError
+-    Task patch(TaskId id, TaskPatch patch);           // PATCH: throws ValidationError / NotFoundError
++    // EX3: expected_version comes from If-Match; mismatch throws PreconditionFailedError
++    Task replace(TaskId id, NewTask input, std::optional<int> expected_version = std::nullopt);
++    Task patch(TaskId id, TaskPatch patch, std::optional<int> expected_version = std::nullopt);
++    TaskStats stats();                                // EX1
++    std::int64_t complete_many(std::vector<TaskId> ids); // EX4: throws ValidationError
+     void remove(TaskId id);                           // throws NotFoundError
+ 
+     TaskRepository& repository() { return repo_; }
+diff -ruN a/tests/test_exercises.cpp b/tests/test_exercises.cpp
+--- a/tests/test_exercises.cpp	1969-12-31 19:00:00
++++ b/tests/test_exercises.cpp	2026-10-03 10:45:02
+@@ -0,0 +1,121 @@
++// HTTP-level tests for the part 3 exercise solutions.
++#include <doctest/doctest.h>
++
++#include <thread>
++
++#include <httplib.h>
++#include <nlohmann/json.hpp>
++
++#include "http/routes.hpp"
++#include "repository/memory_task_repository.hpp"
++
++using namespace tasks;
++using json = nlohmann::json;
++
++namespace {
++
++class Srv {
++public:
++    explicit Srv(http::RouteOptions opts = {}) {
++        http::register_routes(server_, service_, logger_, opts);
++        port_ = server_.bind_to_any_port("127.0.0.1");
++        thread_ = std::jthread([this] { server_.listen_after_bind(); });
++        server_.wait_until_ready();
++    }
++    ~Srv() { server_.stop(); }
++    httplib::Client client() const { return httplib::Client("127.0.0.1", port_); }
++
++private:
++    Logger logger_{LogLevel::Error};
++    MemoryTaskRepository repo_;
++    TaskService service_{repo_};
++    httplib::Server server_;
++    int port_{};
++    std::jthread thread_;
++};
++
++constexpr const char* kJson = "application/json";
++
++} // namespace
++
++TEST_CASE("EX1: GET /tasks/stats") {
++    Srv srv;
++    auto cli = srv.client();
++    cli.Post("/tasks", R"({"title":"a","priority":"high"})", kJson);
++    cli.Post("/tasks", R"({"title":"b","status":"done","due_date":"2000-01-01"})", kJson);
++    cli.Post("/tasks", R"({"title":"c","due_date":"2000-01-01"})", kJson);
++    auto r = cli.Get("/tasks/stats");
++    REQUIRE(r);
++    CHECK(r->status == 200);
++    auto s = json::parse(r->body);
++    CHECK(s["total"] == 3);
++    CHECK(s["by_status"]["todo"] == 2);
++    CHECK(s["by_status"]["in_progress"] == 0); // zeros are present
++    CHECK(s["by_priority"]["high"] == 1);
++    CHECK(s["overdue"] == 1);
++}
++
++TEST_CASE("EX2: API key authentication") {
++    Srv srv({.api_key = "s3cret"});
++    auto cli = srv.client();
++    CHECK(cli.Get("/health")->status == 200); // health stays public
++    auto denied = cli.Get("/tasks");
++    CHECK(denied->status == 401);
++    CHECK(denied->get_header_value("WWW-Authenticate") == "Bearer");
++    CHECK(cli.Get("/tasks", {{"Authorization", "Bearer wrong!"}})->status == 401);
++    CHECK(cli.Get("/tasks", {{"Authorization", "Bearer s3cret"}})->status == 200);
++}
++
++TEST_CASE("EX3: ETag and If-Match") {
++    Srv srv;
++    auto cli = srv.client();
++    auto created = cli.Post("/tasks", R"({"title":"doc"})", kJson);
++    CHECK(created->get_header_value("ETag") == "\"1\"");
++
++    auto ok = cli.Patch("/tasks/1", {{"If-Match", "\"1\""}}, R"({"title":"doc v2"})", kJson);
++    CHECK(ok->status == 200);
++    CHECK(ok->get_header_value("ETag") == "\"2\"");
++
++    auto stale = cli.Patch("/tasks/1", {{"If-Match", "\"1\""}}, R"({"title":"lost update"})", kJson);
++    CHECK(stale->status == 412);
++    CHECK(json::parse(stale->body)["error"]["code"] == "precondition_failed");
++
++    CHECK(cli.Patch("/tasks/1", R"({"title":"no header = last write wins"})", kJson)->status == 200);
++    CHECK(cli.Patch("/tasks/1", {{"If-Match", "garbage"}}, R"({"title":"x"})", kJson)->status == 422);
++}
++
++TEST_CASE("EX4: POST /tasks/bulk-complete") {
++    Srv srv;
++    auto cli = srv.client();
++    for (int i = 0; i < 3; ++i) cli.Post("/tasks", R"({"title":"t"})", kJson);
++    auto r = cli.Post("/tasks/bulk-complete", R"({"ids":[1,2,2,99]})", kJson);
++    CHECK(r->status == 200);
++    CHECK(json::parse(r->body)["updated"] == 2);
++    CHECK(json::parse(cli.Get("/tasks?status=done")->body)["total"] == 2);
++    CHECK(cli.Post("/tasks/bulk-complete", R"({"ids":[]})", kJson)->status == 422);
++    CHECK(cli.Post("/tasks/bulk-complete", R"({"ids":["1"]})", kJson)->status == 422);
++}
++
++TEST_CASE("EX5: shape and rule errors are reported together") {
++    Srv srv;
++    auto r = srv.client().Post("/tasks", R"({"title":"   ","priority":"urgent","due_date":"2026-02-30"})", kJson);
++    CHECK(r->status == 422);
++    auto details = json::parse(r->body)["error"]["details"];
++    CHECK(details.contains("title"));    // rule
++    CHECK(details.contains("priority")); // shape
++    CHECK(details.contains("due_date")); // rule
++}
++
++TEST_CASE("EX6: rate limiting") {
++    Srv srv({.rate_limit_rps = 1, .rate_limit_burst = 3});
++    auto cli = srv.client();
++    int ok = 0, limited = 0;
++    for (int i = 0; i < 6; ++i) {
++        auto r = cli.Get("/tasks");
++        (r->status == 200 ? ok : limited)++;
++        if (r->status == 429) CHECK(r->get_header_value("Retry-After") == "1");
++    }
++    CHECK(ok == 3);      // the burst
++    CHECK(limited == 3);
++    CHECK(cli.Get("/health")->status == 200); // never limited
++}
+diff -ruN a/tests/test_repository_contract.cpp b/tests/test_repository_contract.cpp
+--- a/tests/test_repository_contract.cpp	2026-10-03 10:45:02
++++ b/tests/test_repository_contract.cpp	2026-10-03 10:45:02
+@@ -39,12 +39,45 @@
+     }
+     SUBCASE("update applies a patch and reports missing ids") {
+         auto a = repo.create({.title = "before", .due_date = "2026-01-01"});
+-        auto u = repo.update(a.id, {.title = "after", .due_date = std::optional<std::string>{}});
++        auto u = repo.update(a.id, {.title = "after", .due_date = std::optional<std::string>{}}, std::nullopt);
+         REQUIRE(u.has_value());
+         CHECK(u->title == "after");
+         CHECK_FALSE(u->due_date.has_value());
+         CHECK(u->priority == a.priority);
+-        CHECK_FALSE(repo.update(a.id + 100000, {.title = "x"}).has_value());
++        CHECK_FALSE(repo.update(a.id + 100000, {.title = "x"}, std::nullopt).has_value());
++    }
++    SUBCASE("EX3: versions increase and stale versions are rejected") {
++        auto a = repo.create({.title = "v"});
++        CHECK(a.version == 1);
++        auto u = repo.update(a.id, {.title = "v2"}, 1);
++        REQUIRE(u.has_value());
++        CHECK(u->version == 2);
++        auto stale = repo.update(a.id, {.title = "v3"}, 1);
++        REQUIRE_FALSE(stale.has_value());
++        CHECK(stale.error() == UpdateError::VersionConflict);
++        CHECK(repo.update(a.id + 100000, {.title = "x"}, 1).error() == UpdateError::NotFound);
++        CHECK(repo.find(a.id)->title == "v2");
++    }
++    SUBCASE("EX1: stats") {
++        repo.create({.title = "a", .priority = Priority::High, .due_date = "2026-01-01"});                         // overdue
++        repo.create({.title = "b", .status = TaskStatus::Done, .priority = Priority::High, .due_date = "2026-01-01"}); // done: not overdue
++        repo.create({.title = "c", .status = TaskStatus::InProgress, .due_date = "2026-12-31"});                  // future
++        repo.create({.title = "d", .priority = Priority::Low});                                                    // no date
++        auto s = repo.stats("2026-06-15");
++        CHECK(s.total == 4);
++        CHECK(s.by_status[TaskStatus::Todo] == 2);
++        CHECK(s.by_status[TaskStatus::Done] == 1);
++        CHECK(s.by_priority[Priority::High] == 2);
++        CHECK(s.by_priority[Priority::Low] == 1);
++        CHECK(s.overdue == 1);
++    }
++    SUBCASE("EX4: complete_many") {
++        auto a = repo.create({.title = "a"});
++        auto b = repo.create({.title = "b", .status = TaskStatus::Done});
++        auto c = repo.create({.title = "c"});
++        CHECK(repo.complete_many({a.id, b.id, c.id, 999999}) == 2); // b already done, 999999 missing
++        CHECK(repo.find(a.id)->status == TaskStatus::Done);
++        CHECK(repo.find(c.id)->version == 2);
+     }
+     SUBCASE("remove") {
+         auto a = repo.create({.title = "bye"});
