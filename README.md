@@ -83,6 +83,38 @@ docker compose run --rm dev bash -c \
 cd part3-crud-api && docker compose up --build
 ```
 
+### Compiling and running a single file
+
+C and C++ are compiled: first turn the source into an executable, then run it.
+No CMake needed, only the compiler (`xcode-select --install` on macOS):
+
+```bash
+# C++
+clang++ -std=c++23 -Wall -Wextra part1-fundamentals/01-basics/examples/01_hello_world.cpp -o hello
+./hello
+
+# C
+clang -std=c17 -Wall -Wextra part5-c-lowlevel/22-c-memory/examples/05_arena.c -o arena
+./arena
+```
+
+- `-o name` names the executable (otherwise it's `a.out`); run it with `./name`.
+- Headers in the same folder (e.g. `geometry.hpp`) are found automatically; if a
+  program needs other `.cpp`/`.c` files, list them all in the same command.
+- Useful extras: `-g` (debug info), `-fsanitize=address,undefined` (catch memory
+  bugs), `-O2` (optimize). `g++`/`gcc` accept the same flags.
+
+With CMake, every file in `examples/` and `solutions/` becomes its own executable
+next to its chapter in `build/`, named `chNN_ex_<file>` or `chNN_sol_<file>`.
+Build just one with:
+
+```bash
+cmake --build build --target ch01_ex_01_hello_world
+./build/part1-fundamentals/01-basics/ch01_ex_01_hello_world
+```
+
+If `cmake` is missing: `brew install cmake ninja` (see [docs/00-setup.md](docs/00-setup.md)).
+
 ## What has been verified
 
 | Part | How it was checked |
